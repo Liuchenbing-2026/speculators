@@ -550,6 +550,7 @@ def build_draft_model(
             # __init__ resolves its own default ("sdpa") when it is absent.
             config = model_class.config_class.from_pretrained(args.from_pretrained)
             config.transformer_layer_config._attn_implementation = args.draft_attn_impl  # noqa: SLF001
+            _resolve_config_verifier(config, args.verifier_name_or_path)
             return model_class.from_pretrained(
                 args.from_pretrained,
                 config=config,
