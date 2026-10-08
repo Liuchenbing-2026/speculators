@@ -263,6 +263,42 @@ class FormatDictFilter(logging.Filter):
 TB_SUPPORTED_TYPES = (int, float, str, bool, torch.Tensor, type(None))
 
 
+class _ConsoleMetricWriter:
+    """Minimal stand-in for a TensorBoard ``SummaryWriter``.
+
+    Used when the ``tensorboard`` package is unavailable (e.g. offline NPU
+    nodes).  Metrics go to stdout -- not the logging module -- so they survive
+    the ``dictConfig`` reconfiguration the training entrypoint performs and stay
+    greppable in a redirected ``train.log``.
+    """
+
+    def __init__(self, log_dir):
+        self.log_dir = str(log_dir)
+
+    def add_scalar(self, tag, value, global_step=None):
+        print(f"[metric] step={global_step} {tag}={value}", flush=True)  # noqa: T201
+
+    def add_text(self, tag, value, global_step=None):
+        print(  # noqa: T201
+            f"[metric-text] step={global_step} {tag}={value}", flush=True
+        )
+
+    def add_hparams(
+        self,
+        hparams,
+        metrics,  # noqa: ARG002
+        run_name=None,  # noqa: ARG002
+        global_step=None,  # noqa: ARG002
+    ):
+        print(f"[hparams] {hparams}", flush=True)  # noqa: T201
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
 class TensorBoardHandler(logging.Handler):
     """Logger that writes metrics to TensorBoard.
 
@@ -305,13 +341,16 @@ class TensorBoardHandler(logging.Handler):
         try:
             from torch.utils.tensorboard import SummaryWriter  # noqa: PLC0415
         except ImportError as e:
-            msg = (
-                "Could not initialize TensorBoardHandler because package tensorboard "
-                "could not be imported.\n Please ensure it is installed by running "
-                "'pip install tensorboard' or configure the logger to use a different "
-                "backend."
+            warnings.warn(
+                (
+                    "tensorboard package is not installed; falling back to a "
+                    "console metric writer (metrics will be printed to the log). "
+                    f"Original error: {e}"
+                ),
+                stacklevel=2,
             )
-            raise RuntimeError(msg) from e
+            Path.mkdir(self.tboard_init_kwargs["log_dir"], parents=True, exist_ok=True)
+            return _ConsoleMetricWriter(self.tboard_init_kwargs["log_dir"])
 
         Path.mkdir(self.tboard_init_kwargs["log_dir"], parents=True, exist_ok=True)
         return SummaryWriter(**self.tboard_init_kwargs)
