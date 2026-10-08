@@ -54,7 +54,7 @@ def set_seed(seed: int, deterministic: bool = False):
     random.seed(seed)
     np.random.seed(seed)  # noqa: NPY002
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    torch.npu.manual_seed_all(seed)
 
     if deterministic:
         # For deterministic behavior (may impact performance)
@@ -685,8 +685,8 @@ def main(cfg: TrainConfig):  # noqa: C901
     # Cleanup
     del trainer, draft_model
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if torch.npu.is_available():
+        torch.npu.empty_cache()
     maybe_destroy_distributed()
 
 
