@@ -444,6 +444,41 @@ def parse_vocab_mappings(args: argparse.Namespace):
     return result
 
 
+def _resolve_config_verifier(
+    config: PretrainedConfig,
+    verifier_name_or_path: str | None,
+) -> None:
+    """Repoint a saved speculator config's verifier at the CLI-provided path.
+
+    A speculator checkpoint records the verifier it was trained with in
+    ``speculators_config.verifier.name_or_path`` -- frequently a Hugging Face
+    repo id (e.g. ``Qwen/Qwen3.6-35B-A3B``).  ``load_verifier_weights`` later
+    resolves that field and, for a repo id, attempts a Hub download; in an
+    offline / air-gapped environment that raises
+    ``huggingface_hub.errors.LocalEntryNotFoundError`` and aborts the build.
+
+    The precedence rule keeps every value that is still meaningful offline: a
+    recorded verifier that exists on disk wins, and a bare identifier (one with
+    no Hub namespace, e.g. a local directory name) is preserved.  Only a Hub
+    repo id -- ``namespace/name`` -- that is *not* present locally is replaced,
+    since resolving it would force a Hub download.
+    """
+    if not verifier_name_or_path:
+        return
+    speculators_config = getattr(config, "speculators_config", None)
+    if speculators_config is None:
+        return
+    saved = getattr(speculators_config.verifier, "name_or_path", None)
+    if saved:
+        # An existing local path, or a bare identifier with no Hub namespace,
+        # keeps the precedence the config already had.
+        if Path(saved).exists():
+            return
+        if "/" not in saved:
+            return
+    speculators_config.verifier.name_or_path = verifier_name_or_path
+
+
 def _build_from_config_only(
     model_class: type[SpeculatorModel],
     path: str,
@@ -461,16 +496,7 @@ def _build_from_config_only(
     config = model_class.config_class.from_pretrained(path)
     if draft_attn_impl is not None:
         config.transformer_layer_config._attn_implementation = draft_attn_impl  # noqa: SLF001
-    speculators_config = getattr(config, "speculators_config", None)
-    # Fall back to the CLI --verifier-name-or-path only when the saved config has
-    # no verifier path -- either null or blanked to "". A real path in the config
-    # takes precedence and the CLI value is ignored.
-    if (
-        verifier_name_or_path
-        and speculators_config is not None
-        and not getattr(speculators_config.verifier, "name_or_path", None)
-    ):
-        speculators_config.verifier.name_or_path = verifier_name_or_path
+    _resolve_config_verifier(config, verifier_name_or_path)
     model = model_class(config=config)
     if hasattr(model, "load_vocab_mappings"):
         model.load_vocab_mappings(t2d, d2t)  # type: ignore[attr-defined, operator]
