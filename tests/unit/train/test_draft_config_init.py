@@ -442,6 +442,42 @@ def test_build_from_config_only_preserves_existing_verifier_name(tmp_path):
     assert built.config.speculators_config.verifier.name_or_path == "real-verifier"
 
 
+def test_build_from_config_only_falls_back_for_unresolvable_hub_id(tmp_path):
+    # A released checkpoint records the verifier as a Hub repo id
+    # (``namespace/name``). Offline that cannot be resolved, so the explicitly
+    # passed --verifier-name-or-path must win; a bare name keeps precedence.
+    model_dir = _save_config_only_dir(
+        tmp_path, verifier_name_or_path="Qwen/Qwen3.6-35B-A3B"
+    )
+
+    with patch.object(Eagle3DraftModel, "load_verifier_weights"):
+        built = _build_from_config_only(
+            Eagle3DraftModel,
+            str(model_dir),
+            None,
+            None,
+            verifier_name_or_path="local-verifier",
+        )
+
+    assert built.config.speculators_config.verifier.name_or_path == "local-verifier"
+
+
+def test_build_from_config_only_keeps_bare_identifier(tmp_path):
+    # A bare (namespace-less) name is not a Hub repo id: never overridden.
+    model_dir = _save_config_only_dir(tmp_path, verifier_name_or_path="bare-name")
+
+    with patch.object(Eagle3DraftModel, "load_verifier_weights"):
+        built = _build_from_config_only(
+            Eagle3DraftModel,
+            str(model_dir),
+            None,
+            None,
+            verifier_name_or_path="fallback-verifier",
+        )
+
+    assert built.config.speculators_config.verifier.name_or_path == "bare-name"
+
+
 def test_config_roundtrip_drops_attn_implementation(tmp_path):
     # Precondition of the --from-pretrained bug: HF configs never serialize
     # _attn_implementation, so the field does not survive a save/load round-trip
