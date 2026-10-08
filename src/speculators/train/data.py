@@ -280,37 +280,59 @@ class ArrowDataset(BaseDataset):
         dataset_item = self.data[index]
         client_item = build_client_item(dataset_item)
 
-        try:
-            handle = generate_hidden_states(
-                self.client,  # type:ignore[arg-type]
-                self.model,  # type:ignore[arg-type]
-                client_item,
-                timeout=self.request_timeout,
-                max_retries=self.max_retries,
-            )
+        # Rare transient corruption in the vLLM hidden-state extraction path
+        # (CacheOnly KV-cache write/read race under high concurrency) can yield
+        # non-finite values.  Retry a few times and, if it persists, skip the
+        # sample instead of aborting the whole training run.
+        nan_retries = int(os.environ.get("DSPARK_HS_NAN_RETRIES", "4"))
+        last_nan_err: Exception | None = None
 
-            loaded_hs = self.transfer.get_generated(handle)
-            if loaded_hs is None:
-                raise ValueError(f"Failed to load hidden states for handle {handle}")
+        for attempt in range(nan_retries + 1):
+            try:
+                handle = generate_hidden_states(
+                    self.client,  # type:ignore[arg-type]
+                    self.model,  # type:ignore[arg-type]
+                    client_item,
+                    timeout=self.request_timeout,
+                    max_retries=self.max_retries,
+                )
 
-            check_hidden_states(loaded_hs, dataset_item["input_ids"].tolist())
+                loaded_hs = self.transfer.get_generated(handle)
+                if loaded_hs is None:
+                    raise ValueError(
+                        f"Failed to load hidden states for handle {handle}"
+                    )
 
-            file_idx = self._map_to_file_idx(index)
-            match self.on_generate:
-                case "cache":
-                    self.transfer.cache(handle, file_idx)
-                case "delete":
-                    self.transfer.delete(handle)
-        except Exception as e:
-            if isinstance(e, ValueError) and "NaN" in str(e):
-                raise
-            warnings.warn(
-                f"Failed to load/cache hidden states for sample {index}: {e}",
-                stacklevel=1,
-            )
-            return None
+                check_hidden_states(loaded_hs, dataset_item["input_ids"].tolist())
 
-        return loaded_hs
+                file_idx = self._map_to_file_idx(index)
+                match self.on_generate:
+                    case "cache":
+                        self.transfer.cache(handle, file_idx)
+                    case "delete":
+                        self.transfer.delete(handle)
+                return loaded_hs
+            except Exception as e:  # noqa: BLE001
+                if isinstance(e, ValueError) and "NaN" in str(e):
+                    last_nan_err = e
+                    warnings.warn(
+                        f"Non-finite hidden states for sample {index} "
+                        f"(attempt {attempt + 1}/{nan_retries + 1}); retrying",
+                        stacklevel=1,
+                    )
+                    continue
+                warnings.warn(
+                    f"Failed to load/cache hidden states for sample {index}: {e}",
+                    stacklevel=1,
+                )
+                return None
+
+        warnings.warn(
+            f"Skipping sample {index}: non-finite hidden states persisted after "
+            f"{nan_retries + 1} attempts ({last_nan_err})",
+            stacklevel=1,
+        )
+        return None
 
     def _get_raw_data(self, index):
         file_idx = self._map_to_file_idx(index)
