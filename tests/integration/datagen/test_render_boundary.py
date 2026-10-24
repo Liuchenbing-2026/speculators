@@ -7,15 +7,19 @@ scaffold fallback (needs a template that pre-fills ``<think>``), the unstable
 guard (needs a template that rewrites history), and the client's error paths.
 """
 
+import json
+import os
 import time
+from types import SimpleNamespace
 from typing import cast
 
+import httpx
 import pytest
 import torch
 from datasets import Dataset as HFDataset
 from datasets import load_from_disk
 
-from speculators.data_generation import preprocessing, render_client
+from speculators.data_generation import preprocessing, render_client, vllm_client
 from speculators.data_generation.preprocessing import (
     ProcessorLike,
     build_speculator_training_dataset,
@@ -337,3 +341,157 @@ def test_loss_mask_stays_boolean_after_save_load_and_collation(tmp_path, mask):
     )
     assert batch["loss_mask"].dtype == torch.bool
     assert batch["loss_mask"].tolist() == [[False, False, True, True, False, False]]
+
+
+@pytest.mark.parametrize("status", [404, 405])
+def test_preprocess_aborts_when_render_route_disappears(monkeypatch, status):
+    requests = []
+
+    def handle(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        if body["messages"][0]["content"] == "missing":
+            return httpx.Response(status, text="render route unavailable")
+        ids = [1, 2] if body["add_generation_prompt"] else [1, 2, 3]
+        return httpx.Response(200, json={"token_ids": ids})
+
+    conversations = [
+        [{"role": "user", "content": text}, {"role": "assistant", "content": "ok"}]
+        for text in ["good", "missing"]
+    ]
+    with httpx.Client(transport=httpx.MockTransport(handle)) as client:
+        monkeypatch.setattr(render_client, "_client", client)
+        monkeypatch.setattr(render_client, "_client_pid", os.getpid())
+        with pytest.raises(InvalidResponseError, match=str(status)):
+            preprocessing._preprocess_batch(
+                {"conversations": conversations}, False, "http://render.test", 2048
+            )
+    assert len(requests) == 3  # two valid renders, then one permanent route failure
+
+
+@pytest.mark.parametrize("status", [200, 400, 422])
+def test_preprocess_keeps_conversation_specific_render_error_policy(
+    monkeypatch, status
+):
+    def handle(request):
+        body = json.loads(request.content)
+        if status != 200 and body["messages"][0]["content"] == "bad":
+            return httpx.Response(status, text="bad conversation")
+        ids = [1, 2] if body["add_generation_prompt"] else [1, 2, 3]
+        return httpx.Response(200, json={"token_ids": ids})
+
+    conversations = [
+        [{"role": "user", "content": text}, {"role": "assistant", "content": "ok"}]
+        for text in ["good", "bad"]
+    ]
+    with httpx.Client(transport=httpx.MockTransport(handle)) as client:
+        monkeypatch.setattr(render_client, "_client", client)
+        monkeypatch.setattr(render_client, "_client_pid", os.getpid())
+        result = preprocessing._preprocess_batch(
+            {"conversations": conversations}, False, "http://render.test", 2048
+        )
+    assert len(result["input_ids"]) == (2 if status == 200 else 1)
+    assert result["input_ids"][0].tolist() == [1, 2, 3]
+    assert result["loss_mask"][0].tolist() == [False, False, True]
+
+
+# Endpoint-wide failures must survive the conversation-specific skip policy.
+def _endpoint_conversations():
+    return [
+        [{"role": "user", "content": text}, {"role": "assistant", "content": "ok"}]
+        for text in ["good", "bad"]
+    ]
+
+
+def _assert_endpoint_rows(rows, expected):
+    assert len(rows["input_ids"]) == len(expected)
+    assert rows["seq_len"] == [3] * len(expected)
+    for ids, mask, wanted in zip(
+        rows["input_ids"], rows["loss_mask"], expected, strict=True
+    ):
+        assert ids.tolist() == wanted
+        assert mask.tolist() == [False, False, True]
+
+
+def _exercise_endpoint_failure(monkeypatch, failure, *, transient=False):
+    calls = []
+    sleeps: list[float] = []
+    bad_calls = 0
+
+    def handle(request):
+        nonlocal bad_calls
+        body = json.loads(request.content)
+        kind = body["messages"][0]["content"]
+        calls.append({"kind": kind, "prompt": body["add_generation_prompt"]})
+        if kind == "bad":
+            bad_calls += 1
+            if not transient or bad_calls == 1:
+                if failure == "connect":
+                    raise httpx.ConnectError("fixture refused", request=request)
+                if failure == "timeout":
+                    raise httpx.ReadTimeout("fixture timeout", request=request)
+                return httpx.Response(failure, text="fixture render failure")
+        ids = [10, 11] if kind == "good" else [20, 21]
+        if not body["add_generation_prompt"]:
+            ids = [*ids, ids[-1] + 1]
+        return httpx.Response(200, json={"token_ids": ids})
+
+    monkeypatch.setattr(
+        vllm_client,
+        "time",
+        SimpleNamespace(sleep=sleeps.append, monotonic=time.monotonic),
+    )
+    error = None
+    rows = None
+    with httpx.Client(transport=httpx.MockTransport(handle), trust_env=False) as client:
+        monkeypatch.setattr(render_client, "_client", client)
+        monkeypatch.setattr(render_client, "_client_pid", os.getpid())
+        try:
+            rows = preprocessing._preprocess_batch(
+                {"conversations": _endpoint_conversations()},
+                False,
+                "http://render.test",
+                2048,
+            )
+        except Exception as exc:  # noqa: BLE001
+            error = exc
+    return rows, error, calls, sleeps
+
+
+@pytest.mark.parametrize("failure", ["connect", "timeout", 501, 503])
+def test_systemic_failure_aborts_preprocessing_after_default_retries(
+    monkeypatch, failure
+):
+    rows, error, calls, sleeps = _exercise_endpoint_failure(monkeypatch, failure)
+    assert sleeps == [2, 4, 8]
+    assert [item["kind"] for item in calls] == [
+        "good",
+        "good",
+        "bad",
+        "bad",
+        "bad",
+        "bad",
+    ]
+    assert error is not None, (
+        "endpoint failure silently returned a partial training batch"
+    )
+    assert rows is None
+    assert type(error).__name__ == "RenderEndpointError"
+    if isinstance(failure, str):
+        expected = httpx.ConnectError if failure == "connect" else httpx.ReadTimeout
+        assert isinstance(error.__cause__, expected)
+    else:
+        assert str(failure) in str(error)
+
+
+@pytest.mark.parametrize("failure", ["connect", 503])
+def test_transient_endpoint_failure_recovers_without_dropping_rows(
+    monkeypatch, failure
+):
+    rows, error, calls, sleeps = _exercise_endpoint_failure(
+        monkeypatch, failure, transient=True
+    )
+    assert error is None
+    assert sleeps == [2]
+    assert [item["kind"] for item in calls] == ["good", "good", "bad", "bad", "bad"]
+    _assert_endpoint_rows(rows, [[10, 11, 12], [20, 21, 22]])
