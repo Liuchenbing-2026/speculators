@@ -31,6 +31,7 @@ def test_accept_positive_concurrency(concurrency):
     ) as run:
         result = CliRunner().invoke(app, ["--concurrency", str(concurrency)])
     assert result.exit_code == 0, result.output
+    assert run.await_args is not None
     assert run.await_args.kwargs["concurrency"] == concurrency
 
 
