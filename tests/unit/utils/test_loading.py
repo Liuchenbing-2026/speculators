@@ -431,3 +431,24 @@ def test_load_model_layers_hub_repo_does_not_probe_vendor_index(tmp_path):
         "model.safetensors",
         "model.safetensors",
     ]
+
+
+@pytest.mark.smoke
+def test_load_model_layers_skips_non_utf8_vendor_index(tmp_path):
+    """Non-UTF-8 vendor index bytes fall back to single file or FileNotFoundError."""
+    (tmp_path / "quant_model_weights.safetensors.index.json").write_bytes(
+        b"\xff\xfe\x00\x00"
+    )
+    with pytest.raises(FileNotFoundError):
+        load_model_layers(["embed_tokens.weight"], str(tmp_path))
+    with pytest.raises(FileNotFoundError):
+        list_checkpoint_keys(tmp_path)
+
+    single_tensor = torch.full((2, 2), 6.0)
+    save_file(
+        {"model.embed_tokens.weight": single_tensor},
+        str(tmp_path / "model.safetensors"),
+    )
+    loaded = load_model_layers(["embed_tokens.weight"], str(tmp_path))
+    assert torch.equal(loaded["embed_tokens.weight"], single_tensor)
+    assert list_checkpoint_keys(tmp_path) == ["model.embed_tokens.weight"]

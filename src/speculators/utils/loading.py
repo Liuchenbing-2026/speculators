@@ -76,9 +76,9 @@ def _load_local_vendor_weight_map(checkpoint_dir: Path) -> dict[str, str] | None
         if not index_path.is_file():
             continue
         try:
-            with index_path.open() as f:
+            with index_path.open(encoding="utf-8") as f:
                 index = json.load(f)
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             logger.warning("Ignoring unreadable vendor index {}: {}", index_path, exc)
             continue
         weight_map = index.get("weight_map") if isinstance(index, dict) else None
