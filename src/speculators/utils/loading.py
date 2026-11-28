@@ -8,6 +8,9 @@ from huggingface_hub.errors import EntryNotFoundError
 from loguru import logger
 from safetensors import safe_open
 
+_STANDARD_INDEX_FILENAME = "model.safetensors.index.json"
+_LOCAL_VENDOR_INDEX_FILENAMES = ("quant_model_weights.safetensors.index.json",)
+
 _WEIGHT_ALIASES: dict[str, list[str]] = {
     "embed_tokens.weight": [
         "tok_embeddings.weight",
@@ -66,6 +69,33 @@ def is_config_only_dir(path: str | Path) -> bool:
     return has_config and not has_weights
 
 
+def _load_local_vendor_weight_map(checkpoint_dir: Path) -> dict[str, str] | None:
+    """Return ``weight_map`` from a known local vendor index if valid."""
+    for filename in _LOCAL_VENDOR_INDEX_FILENAMES:
+        index_path = checkpoint_dir / filename
+        if not index_path.is_file():
+            continue
+        try:
+            with index_path.open() as f:
+                index = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Ignoring unreadable vendor index {}: {}", index_path, exc)
+            continue
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if (
+            not isinstance(weight_map, dict)
+            or not weight_map
+            or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in weight_map.items()
+            )
+        ):
+            logger.warning("Ignoring invalid weight_map in vendor index {}", index_path)
+            continue
+        logger.info("Using local vendor safetensors index: {}", index_path)
+        return weight_map
+    return None
+
+
 def list_checkpoint_keys(checkpoint_dir: str | Path) -> list[str]:
     """List all tensor keys in a checkpoint without loading weights.
 
@@ -76,10 +106,14 @@ def list_checkpoint_keys(checkpoint_dir: str | Path) -> list[str]:
     """
     checkpoint_dir = Path(checkpoint_dir)
 
-    index_path = checkpoint_dir / "model.safetensors.index.json"
+    index_path = checkpoint_dir / _STANDARD_INDEX_FILENAME
     if index_path.exists():
         with index_path.open() as f:
             return list(json.load(f)["weight_map"].keys())
+
+    vendor_weight_map = _load_local_vendor_weight_map(checkpoint_dir)
+    if vendor_weight_map is not None:
+        return list(vendor_weight_map.keys())
 
     single = checkpoint_dir / "model.safetensors"
     if single.exists():
@@ -88,7 +122,8 @@ def list_checkpoint_keys(checkpoint_dir: str | Path) -> list[str]:
 
     raise FileNotFoundError(
         f"No safetensors checkpoint found at {checkpoint_dir}. "
-        "Expected model.safetensors.index.json or model.safetensors."
+        "Expected model.safetensors.index.json, a supported local vendor index, "
+        "or model.safetensors."
     )
 
 
@@ -107,19 +142,26 @@ def load_model_layers(
     """
     # download the index file or build weight map for single-file models
     try:
-        index_file = _resolve_file(model_path, "model.safetensors.index.json")
+        index_file = _resolve_file(model_path, _STANDARD_INDEX_FILENAME)
         with Path(index_file).open() as f:
             index = json.load(f)
         weight_map: dict[str, str] = index["weight_map"]
     except (FileNotFoundError, EntryNotFoundError):
-        logger.warning(
-            "`model.safetensors.index.json` file not found. "
-            "Checking for `model.safetensors` instead."
+        model_dir = Path(model_path)
+        vendor_weight_map = (
+            _load_local_vendor_weight_map(model_dir) if model_dir.is_dir() else None
         )
-        model_file = _resolve_file(model_path, "model.safetensors")
-        # Build virtual weight map for single-file models
-        with safe_open(model_file, framework="pt", device="cpu") as f:
-            weight_map = dict.fromkeys(f.keys(), "model.safetensors")
+        if vendor_weight_map is not None:
+            weight_map = vendor_weight_map
+        else:
+            logger.warning(
+                "`model.safetensors.index.json` file not found. "
+                "Checking for `model.safetensors` instead."
+            )
+            model_file = _resolve_file(model_path, "model.safetensors")
+            # Build virtual weight map for single-file models
+            with safe_open(model_file, framework="pt", device="cpu") as f:
+                weight_map = dict.fromkeys(f.keys(), "model.safetensors")
 
     # Resolve names: try exact match, then suffix match, then known aliases
     name_to_key = {}  # Maps input name to actual checkpoint key

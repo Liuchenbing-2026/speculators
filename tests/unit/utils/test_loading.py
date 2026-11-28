@@ -2,14 +2,21 @@
 Unit tests for the loading module in the Speculators library.
 """
 
+import json
+from pathlib import Path
+from unittest.mock import patch
+
 import pytest
 import torch
+from huggingface_hub.errors import EntryNotFoundError
+from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM
 
 from speculators.utils.loading import (
     _resolve_file,
     _resolve_key,
     is_config_only_dir,
+    list_checkpoint_keys,
     load_model_layers,
 )
 
@@ -308,3 +315,119 @@ def test_load_model_layers_matches_full_model():
         assert torch.equal(util_tensor, model_tensor), (
             f"Tensor values don't match for {layer_name}"
         )
+
+
+@pytest.mark.smoke
+def test_load_model_layers_local_vendor_quant_index(tmp_path):
+    """Local quantized index resolves tensors without model.safetensors.index.json."""
+    embed = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    head = torch.ones(2, 3, dtype=torch.float32) * 2.5
+    shard_0 = "quant_model_weights-00001-of-00002.safetensors"
+    shard_1 = "quant_model_weights-00002-of-00002.safetensors"
+    save_file({"model.embed_tokens.weight": embed}, str(tmp_path / shard_0))
+    save_file({"lm_head.weight": head}, str(tmp_path / shard_1))
+    (tmp_path / "quant_model_weights.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.embed_tokens.weight": shard_0,
+                    "lm_head.weight": shard_1,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_model_layers(["embed_tokens.weight", "lm_head.weight"], str(tmp_path))
+    assert torch.equal(loaded["embed_tokens.weight"], embed)
+    assert torch.equal(loaded["lm_head.weight"], head)
+    assert set(list_checkpoint_keys(tmp_path)) == {
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+    }
+
+
+@pytest.mark.smoke
+def test_load_model_layers_prefers_standard_index_over_vendor_index(tmp_path):
+    """When both standard and vendor quantized indexes exist, prefer standard."""
+    std_tensor = torch.full((2, 2), 3.0)
+    vendor_tensor = torch.full((2, 2), 9.0)
+    save_file(
+        {"model.embed_tokens.weight": std_tensor},
+        str(tmp_path / "std.safetensors"),
+    )
+    save_file(
+        {"model.embed_tokens.weight": vendor_tensor},
+        str(tmp_path / "vendor.safetensors"),
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"model.embed_tokens.weight": "std.safetensors"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "quant_model_weights.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.embed_tokens.weight": "vendor.safetensors",
+                    "vendor_only.weight": "vendor.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_model_layers(["embed_tokens.weight"], str(tmp_path))
+    assert torch.equal(loaded["embed_tokens.weight"], std_tensor)
+    assert list_checkpoint_keys(tmp_path) == ["model.embed_tokens.weight"]
+
+
+@pytest.mark.smoke
+def test_load_model_layers_skips_invalid_vendor_index(tmp_path):
+    """Invalid vendor index JSON falls back to single file or FileNotFoundError."""
+    (tmp_path / "quant_model_weights.safetensors.index.json").write_text(
+        "{not valid json",
+        encoding="utf-8",
+    )
+    with pytest.raises(FileNotFoundError):
+        load_model_layers(["embed_tokens.weight"], str(tmp_path))
+    with pytest.raises(FileNotFoundError):
+        list_checkpoint_keys(tmp_path)
+
+    single_tensor = torch.full((2, 2), 4.0)
+    save_file(
+        {"model.embed_tokens.weight": single_tensor},
+        str(tmp_path / "model.safetensors"),
+    )
+    loaded = load_model_layers(["embed_tokens.weight"], str(tmp_path))
+    assert torch.equal(loaded["embed_tokens.weight"], single_tensor)
+    assert list_checkpoint_keys(tmp_path) == ["model.embed_tokens.weight"]
+
+
+@pytest.mark.smoke
+def test_load_model_layers_hub_repo_does_not_probe_vendor_index(tmp_path):
+    """Non-directory Hub repo ids must not probe local vendor index filenames."""
+    single_file = tmp_path / "model.safetensors"
+    expected = torch.full((2, 2), 5.0)
+    save_file({"model.embed_tokens.weight": expected}, str(single_file))
+
+    seen_filenames: list[str] = []
+
+    def fake_resolve_file(_model_path: str, file_name: str) -> Path:
+        seen_filenames.append(file_name)
+        if file_name == "model.safetensors.index.json":
+            raise EntryNotFoundError("not on hub")
+        if file_name == "model.safetensors":
+            return single_file
+        raise AssertionError(f"Unexpected Hub probe: {file_name}")
+
+    with patch(
+        "speculators.utils.loading._resolve_file", side_effect=fake_resolve_file
+    ):
+        loaded = load_model_layers(["embed_tokens.weight"], "org/single-file-model")
+
+    assert torch.equal(loaded["embed_tokens.weight"], expected)
+    assert seen_filenames == [
+        "model.safetensors.index.json",
+        "model.safetensors",
+        "model.safetensors",
+    ]
